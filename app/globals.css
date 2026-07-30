@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+/* ==========================================================
+   Identidade Kim Restaurante e Pizzaria
+   Preto e branco, com detalhes em dourado.
+   O PDV tem visual fixo (claro) — nao segue o tema do sistema.
+   ========================================================== */
+
+@theme {
+  --color-gold-50: #fbf7ec;
+  --color-gold-100: #f6edd3;
+  --color-gold-200: #eddca5;
+  --color-gold-300: #e0c56e;
+  --color-gold-400: #d3ae43;
+  --color-gold-500: #c9a227;
+  --color-gold-600: #a8841c;
+  --color-gold-700: #806318;
+  --color-gold-800: #5a4715;
+  --color-gold-900: #3b2f11;
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Esconde a barra de rolagem (usada na faixa horizontal de categorias).
+   Vinha sendo usada no JSX mas nao existia: e de um plugin nao instalado. */
+@utility scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Barra de rolagem discreta nas listas internas (previa das comandas,
+   cardapio, cupom) — a padrao do Chrome e grossa demais e quebra o visual. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-neutral-300) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-neutral-300);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-neutral-400);
+}
