@@ -1,7 +1,8 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Image from "next/image";
 import { supabase } from "@/lib/supabase";
+import { autenticar } from "./actions";
 import {
   IconSearch, IconPlus, IconTrash, IconPrinter, IconLock, IconLogout,
   IconSettings, IconArrowLeft, IconRotateLeft, IconX, IconCheck, IconBell,
@@ -45,8 +46,30 @@ interface ItemRascunho {
   vai_para_cozinha: boolean;
 }
 
-/** Máximo de sabores extras além do primeiro (4 sabores no total). */
-const MAX_SABORES_EXTRA = 3;
+/** Máximo de sabores na mesma pizza. */
+const MAX_SABORES = 4;
+
+/** Id do card único de pizza na lista de produtos. Negativo de propósito:
+ *  é um item virtual, não existe na tabela `produtos`. */
+const ID_CARD_PIZZA = -1;
+
+/** Categorias que mais saem: ficam no começo do carrossel, nesta ordem.
+ *  A comparação é por trecho do nome, sem acento e sem caixa, então
+ *  "file" pega "Filés, Lombo e Frango" e "suco" pega "Sucos". */
+const CATEGORIAS_PRIORITARIAS = [
+  "pizza", "file", "picanha", "petisco", "refrigerante", "cerveja",
+  "suco", "sobremesa", "arroz", "massa", "peixe", "salada",
+];
+
+const semAcento = (texto: string) =>
+  texto.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+/** Posição da categoria na lista de prioridade; quem não está fica no fim. */
+const pesoCategoria = (categoria: string) => {
+  const nome = semAcento(categoria);
+  const posicao = CATEGORIAS_PRIORITARIAS.findIndex((chave) => nome.includes(chave));
+  return posicao === -1 ? CATEGORIAS_PRIORITARIAS.length : posicao;
+};
 
 export default function PDV() {
 
@@ -54,6 +77,7 @@ export default function PDV() {
   const [perfilUsuario, setPerfilUsuario] = useState<'admin' | 'garcom' | null>(null); 
   const [senhaDigitada, setSenhaDigitada] = useState("");
   const [erroLogin, setErroLogin] = useState("");
+  const [entrando, setEntrando] = useState(false);
 
 
   const [carrinhoMobileAberto, setCarrinhoMobileAberto] = useState(false);
@@ -78,12 +102,10 @@ export default function PDV() {
   const [enviandoPedido, setEnviandoPedido] = useState(false);
   const [fechandoConta, setFechandoConta] = useState(false);
 
-  // Configurador de pizza. `sabor1` é o sabor em que o garçom tocou.
+  // Configurador de pizza: primeiro o tamanho, depois os sabores.
   const [configPizza, setConfigPizza] = useState<{
-    sabor1: Produto;
     tamanhoId: number | null;
-    varios: boolean;          // "mais de um sabor"
-    saboresExtra: number[];   // ids dos sabores adicionais (até 3)
+    sabores: number[];        // ids dos sabores escolhidos (1 a MAX_SABORES)
     observacao: string;
   } | null>(null);
 
@@ -104,8 +126,13 @@ export default function PDV() {
     return []; // Se não tiver nada salvo, começa vazio
   });
 
+  // Espelho da fila para os callbacks do tempo real, que são registrados
+  // uma vez só e congelariam o state do primeiro render.
+  const pedidosPendentesRef = useRef(pedidosPendentes);
+
   // Salva os pedidos pendentes no LocalStorage sempre que a lista mudar
   useEffect(() => {
+    pedidosPendentesRef.current = pedidosPendentes;
     localStorage.setItem('pedidosPendentesKim', JSON.stringify(pedidosPendentes));
   }, [pedidosPendentes]);
 
@@ -161,28 +188,6 @@ export default function PDV() {
     };
   }, [perfilUsuario]);
 
-  // Fica escutando a tabela de Comandas (Mesas) em tempo real
-  useEffect(() => {
-    if (!perfilUsuario) return;
-
-    const canalMesas = supabase
-      .channel('mudancas-mesas')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'comandas' },
-        () => {
-          // Quando o garçom criar uma mesa, o banco avisa o sistema do dono
-          // e esta função abaixo atualiza a tela automaticamente
-          carregarDados(); 
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(canalMesas);
-    };
-  }, [perfilUsuario]);
-
   // Escuta mudanças no estoque (produtos) em tempo real para TODOS os usuários
   useEffect(() => {
     // Esse canal fica aberto para o Admin e para o Garçom
@@ -231,6 +236,39 @@ export default function PDV() {
     }
   }, [perfilUsuario]); 
 
+  // Fichas na fila cujo item já não existe mais no banco (o caixa cancelou
+  // o pedido, ou a comanda foi apagada) somem da fila sozinhas.
+  const limparPendentesOrfas = (
+    comandasAtuais: { itens_comanda?: { id: number }[] }[],
+    pendentesAntes: { id: number }[],
+  ) => {
+    const idsVivos = new Set<number>(
+      comandasAtuais.flatMap((c) => (c.itens_comanda || []).map((i) => i.id))
+    );
+    const idsAntes = new Set<number>(pendentesAntes.map((p) => p.id));
+
+    setPedidosPendentes((prev) =>
+      // Só descarta o que já estava na fila antes da consulta: uma ficha que
+      // chegou enquanto o banco respondia não pode ser jogada fora por engano.
+      prev.filter((p) => !idsAntes.has(p.id) || idsVivos.has(p.id))
+    );
+  };
+
+  // Recarrega só as comandas, sem acender a tela de "Carregando sistema".
+  // É o que o tempo real dispara a cada pedido novo.
+  const carregarComandas = async () => {
+    const pendentesAntes = pedidosPendentesRef.current;
+
+    const { data: dbComandas } = await supabase
+      .from('comandas')
+      .select('*, itens_comanda(*, produtos(*))')
+      .order('created_at', { ascending: false });
+
+    if (!dbComandas) return;
+    setComandas(dbComandas);
+    limparPendentesOrfas(dbComandas, pendentesAntes);
+  };
+
   const carregarDados = async () => {
     setCarregando(true);
     const { data: dbProdutos } = await supabase.from('produtos').select('*').order('nome');
@@ -239,32 +277,69 @@ export default function PDV() {
     const { data: dbTamanhos } = await supabase.from('pizza_tamanhos').select('*').order('ordem');
     if (dbTamanhos) setTamanhosPizza(dbTamanhos);
 
-    const { data: dbComandas } = await supabase
-      .from('comandas')
-      .select('*, itens_comanda(*, produtos(*))')
-      .order('created_at', { ascending: false });
-    
-    if (dbComandas) setComandas(dbComandas);
+    await carregarComandas();
     setCarregando(false);
   };
 
-const fazerLogin = (e: React.FormEvent) => {
+  // Uma rajada de INSERTs (pedido de 4 itens) vira uma consulta só.
+  const recargaAgendada = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const agendarRecargaComandas = () => {
+    if (recargaAgendada.current) clearTimeout(recargaAgendada.current);
+    recargaAgendada.current = setTimeout(() => {
+      recargaAgendada.current = null;
+      carregarComandas();
+    }, 250);
+  };
+
+  // Tempo real das mesas e do que está dentro delas. Vale para o caixa e
+  // para o garçom: mesa nova, item novo e item cancelado aparecem sozinhos.
+  useEffect(() => {
+    if (!perfilUsuario) return;
+
+    const canalComandas = supabase
+      .channel('mudancas-comandas')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'comandas' },
+        () => agendarRecargaComandas()
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'itens_comanda' },
+        () => agendarRecargaComandas()
+      )
+      .subscribe();
+
+    return () => {
+      if (recargaAgendada.current) clearTimeout(recargaAgendada.current);
+      supabase.removeChannel(canalComandas);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [perfilUsuario]);
+
+const fazerLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    const senhaAdmin = process.env.NEXT_PUBLIC_SENHA_ADMIN;
-    const senhaGarcom = process.env.NEXT_PUBLIC_SENHA_GARCOM;
-    
-    if (senhaDigitada === senhaAdmin) {
-      setPerfilUsuario('admin');
-      localStorage.setItem('perfilKim', 'admin'); // <-- SALVA AQUI
-      setSenhaDigitada('');
-      setErroLogin('');
-    } else if (senhaDigitada === senhaGarcom) {
-      setPerfilUsuario('garcom');
-      localStorage.setItem('perfilKim', 'garcom'); // <-- SALVA AQUI
-      setSenhaDigitada('');
-      setErroLogin('');
-    } else {
-      setErroLogin('Senha incorreta! Tente novamente.');
+    if (entrando) return;
+
+    setEntrando(true);
+    setErroLogin('');
+
+    try {
+      // A conferência acontece no servidor: a senha não existe aqui no
+      // navegador, só o perfil que o servidor devolve.
+      const perfil = await autenticar(senhaDigitada);
+
+      if (perfil) {
+        setPerfilUsuario(perfil);
+        localStorage.setItem('perfilKim', perfil); // <-- SALVA AQUI
+        setSenhaDigitada('');
+      } else {
+        setErroLogin('Senha incorreta! Tente novamente.');
+      }
+    } catch {
+      setErroLogin('Não foi possível verificar a senha. Tente de novo.');
+    } finally {
+      setEntrando(false);
     }
   };
 
@@ -296,9 +371,15 @@ const fazerLogin = (e: React.FormEvent) => {
 
   const deletarComanda = async (id: number) => {
     if (!confirm("Tem certeza que deseja apagar esta comanda do sistema?")) return;
-    
+
+    // Guarda os itens antes de apagar: as fichas deles saem da fila junto
+    const idsItens = new Set<number>(
+      (comandas.find((c) => c.id === id)?.itens_comanda || []).map((i: { id: number }) => i.id)
+    );
+
     await supabase.from('comandas').delete().eq('id', id);
     setComandas(comandas.filter((c) => c.id !== id));
+    setPedidosPendentes((prev) => prev.filter((p) => !idsItens.has(p.id)));
   };
 
   const fecharComandaBanco = async (id: number) => {
@@ -362,13 +443,9 @@ const fazerLogin = (e: React.FormEvent) => {
   // para o rascunho. Nada ainda toca o banco.
   const escolherProduto = (produto: Produto) => {
     if (produto.eh_pizza) {
-      setConfigPizza({
-        sabor1: produto,
-        tamanhoId: tamanhosPizza[0]?.id ?? null,
-        varios: false,
-        saboresExtra: [],
-        observacao: "",
-      });
+      // Sem tamanho pré-escolhido: os sabores só aparecem depois que o
+      // garçom toca em um dos tamanhos.
+      setConfigPizza({ tamanhoId: null, sabores: [], observacao: "" });
       return;
     }
 
@@ -387,19 +464,19 @@ const fazerLogin = (e: React.FormEvent) => {
     }]);
   };
 
-  // Marca/desmarca um sabor adicional, respeitando o limite
-  const alternarSaborExtra = (idSabor: number) => {
+  // Marca/desmarca um sabor, respeitando o limite
+  const alternarSabor = (idSabor: number) => {
     if (!configPizza) return;
-    const jaTem = configPizza.saboresExtra.includes(idSabor);
+    const jaTem = configPizza.sabores.includes(idSabor);
     if (jaTem) {
       setConfigPizza({
         ...configPizza,
-        saboresExtra: configPizza.saboresExtra.filter((id) => id !== idSabor),
+        sabores: configPizza.sabores.filter((id) => id !== idSabor),
       });
-    } else if (configPizza.saboresExtra.length < MAX_SABORES_EXTRA) {
+    } else if (configPizza.sabores.length < MAX_SABORES) {
       setConfigPizza({
         ...configPizza,
-        saboresExtra: [...configPizza.saboresExtra, idSabor],
+        sabores: [...configPizza.sabores, idSabor],
       });
     }
   };
@@ -413,23 +490,21 @@ const fazerLogin = (e: React.FormEvent) => {
   const adicionarPizzaAoRascunho = () => {
     if (!configPizza) return;
     const tamanho = tamanhosPizza.find((t) => t.id === configPizza.tamanhoId);
-    if (!tamanho) return;
+    if (!tamanho || configPizza.sabores.length === 0) return;
 
-    // Mais de um sabor exige pelo menos um adicional escolhido
-    if (configPizza.varios && configPizza.saboresExtra.length === 0) return;
-
-    const nomesExtra = configPizza.varios
-      ? configPizza.saboresExtra
-          .map((id) => produtos.find((p) => p.id === id)?.nome)
-          .filter((n): n is string => Boolean(n))
-      : [];
+    const nomes = configPizza.sabores
+      .map((id) => produtos.find((p) => p.id === id)?.nome)
+      .filter((n): n is string => Boolean(n));
+    if (nomes.length === 0) return;
 
     const observacao = configPizza.observacao.trim();
 
     setRascunho((prev) => [...prev, {
       tempId: `${Date.now()}-${Math.random()}`,
-      produto_id: configPizza.sabor1.id,
-      descricao: montarDescricaoPizza(tamanho.nome, [configPizza.sabor1.nome, ...nomesExtra]),
+      // O card de pizza é virtual, então o item aponta para o primeiro
+      // sabor escolhido — que é um produto de verdade no banco.
+      produto_id: configPizza.sabores[0],
+      descricao: montarDescricaoPizza(tamanho.nome, nomes),
       observacao: observacao || null,
       // Todos os sabores custam igual, então o preço é o do tamanho
       valor_unitario: Number(tamanho.preco),
@@ -515,6 +590,10 @@ const fazerLogin = (e: React.FormEvent) => {
 
   const removerItem = async (itemId: number) => {
     await supabase.from('itens_comanda').delete().eq('id', itemId);
+
+    // Item cancelado não pode continuar como ficha esperando impressão
+    setPedidosPendentes((prev) => prev.filter((p) => p.id !== itemId));
+
     
     setComandas(comandas.map(c => {
       if (c.id === comandaAbertaId) {
@@ -560,12 +639,47 @@ const fazerLogin = (e: React.FormEvent) => {
   const comandaAtual = comandas.find((c) => c.id === comandaAbertaId);
   const comandasFiltradas = comandas.filter(c => c.nome.toLowerCase().includes(buscaComanda.toLowerCase()));
   
-  const categoriasUnicas = ["Todas", ...Array.from(new Set(produtos.map(p => p.categoria || "Outros")))];
+  // "Todas" primeiro, depois as campeãs de venda (pizza, cerveja, refrigerante)
+  // e o resto na ordem que veio do banco.
+  const categoriasUnicas = [
+    "Todas",
+    ...Array.from(new Set(produtos.map(p => p.categoria || "Outros")))
+      .sort((a, b) => pesoCategoria(a) - pesoCategoria(b)),
+  ];
 
-  const produtosFiltrados = produtos
-    .filter(p => p.disponivel !== false) // <-- Só adicionou esta linha!
-    .filter(p => p.nome.toLowerCase().includes(buscaProduto.toLowerCase()))
-    .filter(p => categoriaSelecionada === "Todas" || (p.categoria || "Outros") === categoriaSelecionada);
+  // Sabores de pizza: não viram card na lista, são escolhidos dentro do
+  // configurador. O que aparece é um card único "Pizza".
+  const saboresPizza = produtos.filter(p => p.eh_pizza && p.disponivel !== false);
+
+  const precoPizzaBase = tamanhosPizza.length > 0
+    ? Math.min(...tamanhosPizza.map(t => Number(t.preco)))
+    : 0;
+
+  const cardPizza: Produto | null = saboresPizza.length > 0 ? {
+    id: ID_CARD_PIZZA,
+    nome: "Pizza",
+    preco: precoPizzaBase,
+    categoria: saboresPizza[0].categoria || "Pizzas",
+    eh_pizza: true,
+    vai_para_cozinha: true,
+  } : null;
+
+  const busca = buscaProduto.trim().toLowerCase();
+
+  // O card responde à busca por "pizza" e também pelo nome de qualquer
+  // sabor: quem digita "calabresa" continua achando o caminho.
+  const cardPizzaVisivel = cardPizza !== null
+    && (busca === "" || "pizza".includes(busca) || saboresPizza.some(p => p.nome.toLowerCase().includes(busca)))
+    && (categoriaSelecionada === "Todas" || cardPizza.categoria === categoriaSelecionada);
+
+  const produtosFiltrados = [
+    ...(cardPizzaVisivel && cardPizza ? [cardPizza] : []),
+    ...produtos
+      .filter(p => !p.eh_pizza)
+      .filter(p => p.disponivel !== false)
+      .filter(p => p.nome.toLowerCase().includes(busca))
+      .filter(p => categoriaSelecionada === "Todas" || (p.categoria || "Outros") === categoriaSelecionada),
+  ];
   
   const produtosAgrupados = produtosFiltrados.reduce((acc: any, produto) => {
     const categoria = produto.categoria || "Outros";
@@ -573,6 +687,10 @@ const fazerLogin = (e: React.FormEvent) => {
     acc[categoria].push(produto);
     return acc;
   }, {});
+
+  // Os blocos da lista seguem a mesma ordem do carrossel.
+  const gruposOrdenados = (Object.entries(produtosAgrupados) as [string, Produto[]][])
+    .sort(([a], [b]) => pesoCategoria(a) - pesoCategoria(b));
 
   // NOVO CÁLCULO: Agrupa TODOS os produtos (inclusive os esgotados) por categoria para o Admin
   const estoqueAgrupado = produtos.reduce((acc: any, produto) => {
@@ -711,9 +829,10 @@ const fazerLogin = (e: React.FormEvent) => {
 
       <button
         type="submit"
-        className="w-full bg-black hover:bg-neutral-800 text-gold-500 font-bold py-4 rounded-xl transition-all active:scale-[0.98] shadow-[0_0_20px_-4px_rgba(201,162,39,0.4)] tracking-[0.15em] uppercase"
+        disabled={entrando}
+        className="w-full bg-black hover:bg-neutral-800 text-gold-500 font-bold py-4 rounded-xl transition-all active:scale-[0.98] shadow-[0_0_20px_-4px_rgba(201,162,39,0.4)] tracking-[0.15em] uppercase disabled:opacity-60 disabled:cursor-not-allowed"
       >
-        ENTRAR
+        {entrando ? 'VERIFICANDO...' : 'ENTRAR'}
       </button>
     </form>
   </div>
@@ -867,8 +986,8 @@ const fazerLogin = (e: React.FormEvent) => {
               </div>
 
               <div className="divide-y divide-neutral-100">
-                {pedidosPendentes.map((pedido, index) => (
-                  <div key={index} className="px-5 py-3.5 flex justify-between items-center gap-4">
+                {pedidosPendentes.map((pedido) => (
+                  <div key={pedido.id} className="px-5 py-3.5 flex justify-between items-center gap-4">
                     <div className="min-w-0">
                       <p className="font-bold text-black truncate">{pedido.mesa}</p>
                       <p className="text-neutral-500 text-sm">
@@ -885,7 +1004,7 @@ const fazerLogin = (e: React.FormEvent) => {
                       {/* Dispensar sem imprimir */}
                       <button
                         onClick={() => {
-                          setPedidosPendentes((prev) => prev.filter((_, i) => i !== index));
+                          setPedidosPendentes((prev) => prev.filter((p) => p.id !== pedido.id));
                         }}
                         className="h-10 w-10 flex items-center justify-center rounded-lg border border-neutral-200 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 transition-colors"
                         title="Dispensar sem imprimir"
@@ -896,7 +1015,7 @@ const fazerLogin = (e: React.FormEvent) => {
                       <button
                         onClick={() => {
                           imprimirFichaCozinha(pedido.mesa, pedido.item, pedido.qtd, pedido.obs);
-                          setPedidosPendentes((prev) => prev.filter((_, i) => i !== index));
+                          setPedidosPendentes((prev) => prev.filter((p) => p.id !== pedido.id));
                         }}
                         className="h-10 px-4 rounded-lg bg-black text-gold-500 font-semibold text-sm flex items-center gap-2 hover:bg-neutral-800 active:scale-[0.98] transition-all"
                       >
@@ -1358,7 +1477,7 @@ const fazerLogin = (e: React.FormEvent) => {
           </div>
           
           <div className="overflow-y-auto pr-2 pb-10 flex-grow">
-            {Object.keys(produtosAgrupados).length === 0 ? (
+            {gruposOrdenados.length === 0 ? (
               <div className="text-center py-16 px-6">
                 <span className="inline-flex h-14 w-14 items-center justify-center rounded-full bg-neutral-100 text-neutral-400 mb-4">
                   <IconSearch className="w-7 h-7" />
@@ -1367,7 +1486,7 @@ const fazerLogin = (e: React.FormEvent) => {
                 <p className="text-neutral-400 text-sm mt-1">Tente outro termo ou mude a categoria.</p>
               </div>
             ) : (
-              Object.entries(produtosAgrupados).map(([categoria, itens]: any) => (
+              gruposOrdenados.map(([categoria, itens]) => (
                 <div key={categoria} className="mb-9">
                   <div className="flex items-center gap-3 mb-4">
                     <h2 className="text-[11px] font-bold uppercase text-neutral-400 tracking-[0.18em] shrink-0">
@@ -1726,15 +1845,11 @@ const fazerLogin = (e: React.FormEvent) => {
       {/* ================================================= */}
       {configPizza && (() => {
         const tamanho = tamanhosPizza.find((t) => t.id === configPizza.tamanhoId);
-        const nomesExtra = configPizza.saboresExtra
+        const nomesEscolhidos = configPizza.sabores
           .map((id) => produtos.find((p) => p.id === id)?.nome)
           .filter((n): n is string => Boolean(n));
-        const faltaSabor = configPizza.varios && configPizza.saboresExtra.length === 0;
-        const limiteAtingido = configPizza.saboresExtra.length >= MAX_SABORES_EXTRA;
-        // Outros sabores de pizza, para as demais frações
-        const outrosSabores = produtos
-          .filter((p) => p.eh_pizza && p.disponivel !== false && p.id !== configPizza.sabor1.id);
-        const totalSabores = 1 + (configPizza.varios ? configPizza.saboresExtra.length : 0);
+        const limiteAtingido = configPizza.sabores.length >= MAX_SABORES;
+        const completo = Boolean(tamanho) && configPizza.sabores.length > 0;
 
         return (
           <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm p-0 sm:p-4 print:hidden">
@@ -1744,7 +1859,9 @@ const fazerLogin = (e: React.FormEvent) => {
               <div className="flex items-start justify-between gap-3 p-5 border-b border-neutral-200 shrink-0">
                 <div className="min-w-0">
                   <p className="text-[10px] font-bold uppercase tracking-[0.18em] text-gold-600">Montar pizza</p>
-                  <h2 className="text-xl font-bold text-black leading-tight truncate">{configPizza.sabor1.nome}</h2>
+                  <h2 className="text-xl font-bold text-black leading-tight truncate">
+                    {tamanho ? `Pizza ${tamanho.nome}` : 'Escolha o tamanho'}
+                  </h2>
                 </div>
                 <button
                   onClick={() => setConfigPizza(null)}
@@ -1756,9 +1873,11 @@ const fazerLogin = (e: React.FormEvent) => {
               </div>
 
               <div className="p-5 overflow-y-auto flex flex-col gap-6">
-                {/* TAMANHO */}
+                {/* PASSO 1: TAMANHO */}
                 <div>
-                  <p className="text-[11px] font-bold uppercase tracking-[0.15em] text-neutral-400 mb-2.5">Tamanho</p>
+                  <p className="text-[11px] font-bold uppercase tracking-[0.15em] text-neutral-400 mb-2.5">
+                    1. Tamanho
+                  </p>
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                     {tamanhosPizza.map((t) => (
                       <button
@@ -1784,58 +1903,27 @@ const fazerLogin = (e: React.FormEvent) => {
                   </div>
                 </div>
 
-                {/* UM SABOR OU MAIS DE UM */}
-                <div>
-                  <p className="text-[11px] font-bold uppercase tracking-[0.15em] text-neutral-400 mb-2.5">Sabores</p>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={() => setConfigPizza({ ...configPizza, varios: false, saboresExtra: [] })}
-                      className={`py-3 rounded-xl border font-semibold text-sm transition-all ${
-                        !configPizza.varios
-                          ? 'bg-black border-black text-gold-500'
-                          : 'bg-white border-neutral-200 text-neutral-600 hover:border-neutral-400'
-                      }`}
-                    >
-                      Um sabor
-                    </button>
-                    <button
-                      onClick={() => setConfigPizza({ ...configPizza, varios: true })}
-                      className={`py-3 rounded-xl border font-semibold text-sm transition-all ${
-                        configPizza.varios
-                          ? 'bg-black border-black text-gold-500'
-                          : 'bg-white border-neutral-200 text-neutral-600 hover:border-neutral-400'
-                      }`}
-                    >
-                      Mais de um sabor
-                    </button>
-                  </div>
-                  <p className="text-xs text-neutral-400 mt-2">
-                    Até {MAX_SABORES_EXTRA + 1} sabores na mesma pizza. O preço não muda: todos
-                    custam igual no mesmo tamanho.
-                  </p>
-                </div>
-
-                {/* SABORES ADICIONAIS */}
-                {configPizza.varios && (
+                {/* PASSO 2: SABORES — só depois de escolher o tamanho */}
+                {tamanho ? (
                   <div>
                     <div className="flex items-baseline justify-between gap-2 mb-2.5">
                       <p className="text-[11px] font-bold uppercase tracking-[0.15em] text-neutral-400">
-                        Outros sabores
+                        2. Sabores
                       </p>
                       <p className={`text-[11px] font-semibold tabular-nums ${limiteAtingido ? 'text-gold-700' : 'text-neutral-400'}`}>
-                        {configPizza.saboresExtra.length} de {MAX_SABORES_EXTRA}
+                        {configPizza.sabores.length} de {MAX_SABORES}
                       </p>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2 max-h-52 overflow-y-auto pr-1">
-                      {outrosSabores.map((p) => {
-                        const marcado = configPizza.saboresExtra.includes(p.id);
+                    <div className="grid grid-cols-2 gap-2">
+                      {saboresPizza.map((p) => {
+                        const marcado = configPizza.sabores.includes(p.id);
                         // Cheio: só deixa desmarcar o que já está escolhido
                         const bloqueado = !marcado && limiteAtingido;
                         return (
                           <button
                             key={p.id}
-                            onClick={() => alternarSaborExtra(p.id)}
+                            onClick={() => alternarSabor(p.id)}
                             disabled={bloqueado}
                             className={`px-3 py-2.5 rounded-xl border text-left text-sm font-medium transition-all flex items-center gap-2 ${
                               marcado
@@ -1852,15 +1940,21 @@ const fazerLogin = (e: React.FormEvent) => {
                       })}
                     </div>
 
-                    {limiteAtingido && (
-                      <p className="text-xs text-gold-700 mt-2">
-                        Limite de {MAX_SABORES_EXTRA + 1} sabores atingido. Desmarque um para trocar.
-                      </p>
-                    )}
+                    <p className={`text-xs mt-2 ${limiteAtingido ? 'text-gold-700' : 'text-neutral-400'}`}>
+                      {limiteAtingido
+                        ? `Limite de ${MAX_SABORES} sabores atingido. Desmarque um para trocar.`
+                        : `Até ${MAX_SABORES} sabores na mesma pizza. O preço não muda: é sempre o do tamanho.`}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-dashed border-neutral-300 bg-neutral-50 px-4 py-6 text-center">
+                    <p className="text-sm text-neutral-500">
+                      Escolha o tamanho acima para liberar os sabores.
+                    </p>
                   </div>
                 )}
 
-                {/* OBSERVAÇÕES (só pizza) */}
+                {/* OBSERVAÇÕES */}
                 <div>
                   <label htmlFor="obs-pizza" className="block text-[11px] font-bold uppercase tracking-[0.15em] text-neutral-400 mb-2.5">
                     Observações
@@ -1884,19 +1978,19 @@ const fazerLogin = (e: React.FormEvent) => {
               <div className="p-5 border-t border-neutral-200 bg-neutral-50 shrink-0">
                 <div className="mb-3">
                   <p className="text-sm text-neutral-600 leading-snug">
-                    {tamanho ? (
-                      faltaSabor ? (
-                        <span className="text-gold-700 font-medium">Escolha pelo menos um sabor adicional</span>
+                    {!tamanho ? 'Escolha o tamanho' : (
+                      nomesEscolhidos.length === 0 ? (
+                        <span className="text-gold-700 font-medium">Escolha pelo menos um sabor</span>
                       ) : (
                         <span className="font-semibold text-black">
-                          {montarDescricaoPizza(tamanho.nome, [configPizza.sabor1.nome, ...nomesExtra])}
+                          {montarDescricaoPizza(tamanho.nome, nomesEscolhidos)}
                         </span>
                       )
-                    ) : 'Escolha o tamanho'}
+                    )}
                   </p>
-                  {tamanho && !faltaSabor && totalSabores > 1 && (
+                  {completo && nomesEscolhidos.length > 1 && (
                     <p className="text-xs text-neutral-500 mt-0.5">
-                      {totalSabores} sabores, {tamanho.fatias ? `${tamanho.fatias} no total` : 'divididos igualmente'}
+                      {nomesEscolhidos.length} sabores, {tamanho!.fatias ? `${tamanho!.fatias} no total` : 'divididos igualmente'}
                     </p>
                   )}
                   {configPizza.observacao.trim() && (
@@ -1908,13 +2002,13 @@ const fazerLogin = (e: React.FormEvent) => {
 
                 <button
                   onClick={adicionarPizzaAoRascunho}
-                  disabled={!tamanho || faltaSabor}
+                  disabled={!completo}
                   className="w-full py-4 bg-black text-gold-500 rounded-xl font-bold flex items-center justify-center gap-2 hover:bg-neutral-800 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <IconPlus className="w-5 h-5" />
                   Adicionar ao pedido
-                  {tamanho && !faltaSabor && (
-                    <span className="tabular-nums font-semibold">· R$ {Number(tamanho.preco).toFixed(2)}</span>
+                  {completo && (
+                    <span className="tabular-nums font-semibold">· R$ {Number(tamanho!.preco).toFixed(2)}</span>
                   )}
                 </button>
               </div>
