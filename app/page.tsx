@@ -1747,19 +1747,6 @@ const fazerLogin = async (e: React.FormEvent) => {
             <p className="font-bold uppercase text-sm mt-1 print:text-black print:font-black">{formaPagamento}</p>
           </div>
 
-          {/* MÁGICA DO QR CODE PIX */}
-          {formaPagamento === 'Pix' && (
-            <div className="mt-4 mb-2 flex flex-col items-center border-t-2 border-b-2 border-dashed border-neutral-300 print:border-black py-4 print:break-inside-avoid">
-              <p className="text-xs font-bold text-neutral-800 print:text-black print:font-black uppercase tracking-widest mb-2">Pague com PIX</p>
-              
-              <img src="/pix.png" alt="QR Code PIX" className="w-32 h-32 object-contain print:block grayscale print:contrast-125" />
-              
-              <p className="text-[11px] mt-2 text-neutral-500 print:text-black print:font-bold text-center">
-                Chave: (31) 99650-5970 <br/>
-                <span className="font-normal print:font-bold text-neutral-400 print:text-black">Kim Restaurante e Pizzaria</span>
-              </p>
-            </div>
-          )}
           
           {/* RODAPÉ */}
           <div className="text-center mt-6 text-xs border-t-2 border-dashed border-neutral-300 print:border-black pt-6 pb-4 print:pb-0 text-neutral-500 print:text-black print:font-bold flex flex-col items-center justify-center print:break-inside-avoid">
